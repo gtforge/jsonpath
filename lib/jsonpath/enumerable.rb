@@ -1,95 +1,139 @@
+# frozen_string_literal: true
+
 class JsonPath
   class Enumerable
     include ::Enumerable
-    attr_reader :allow_eval
-    alias_method :allow_eval?, :allow_eval
+    include Dig
 
-    def initialize(path, object, mode, options = nil)
-      @path, @object, @mode, @options = path.path, object, mode, options
-      @allow_eval = @options && @options.key?(:allow_eval) ? @options[:allow_eval] : true
+    def initialize(path, object, mode, options = {})
+      @path = path.path
+      @object = object
+      @mode = mode
+      @options = options
     end
 
     def each(context = @object, key = nil, pos = 0, &blk)
-      node = key ? context[key] : context
+      node = key ? dig_one(context, key) : context
       @_current_node = node
       return yield_value(blk, context, key) if pos == @path.size
+
       case expr = @path[pos]
-      when '*', '..'
+      when '*', '..', '@'
         each(context, key, pos + 1, &blk)
       when '$'
         each(context, key, pos + 1, &blk) if node == @object
-      when '@'
-        each(context, key, pos + 1, &blk)
       when /^\[(.*)\]$/
-        expr[1,expr.size - 2].split(',').each do |sub_path|
-          case sub_path[0]
-          when ?', ?"
-            if node.is_a?(Hash)
-              k = sub_path[1,sub_path.size - 2]
-              each(node, k, pos + 1, &blk) if node.key?(k)
-            end
-          when ??
-            raise "Cannot use ?(...) unless eval is enabled" unless allow_eval?
-            case node
-            when Hash, Array
-              (node.is_a?(Hash) ? node.keys : (0..node.size)).each do |e|
-                @_current_node = node[e]
-                if process_function_or_literal(sub_path[1, sub_path.size - 1])
-                  each(@_current_node, nil, pos + 1, &blk)
-                end
-              end
-            else
-              yield node if process_function_or_literal(sub_path[1, sub_path.size - 1])
-            end
-          else
-            if node.is_a?(Array)
-              next if node.empty?
-              array_args = sub_path.split(':')
-              if array_args[0] == ?*
-                start_idx = 0
-                end_idx = node.size - 1
-              else
-                start_idx = process_function_or_literal(array_args[0], 0)
-                next unless start_idx
-                end_idx = (array_args[1] && process_function_or_literal(array_args[1], -1) || (sub_path.count(':') == 0 ? start_idx : -1))
-                next unless end_idx
-                if start_idx == end_idx
-                  next unless start_idx < node.size 
-                end
-              end
-              start_idx %= node.size
-              end_idx %= node.size
-              step = process_function_or_literal(array_args[2], 1)
-              next unless step
-              (start_idx..end_idx).step(step) {|i| each(node, i, pos + 1, &blk)}
-            end
-          end
-        end
-      else
-        if pos == (@path.size - 1) && node && allow_eval?
-          if eval("node #{@path[pos]}")
-            yield_value(blk, context, key)
-          end
-        end
+        handle_wildecard(node, expr, context, key, pos, &blk)
+      when /\(.*\)/
+        keys = expr.gsub(/[()]/, '').split(',').map(&:strip)
+        new_context = filter_context(context, keys)
+        yield_value(blk, new_context, key)
       end
 
-      if pos > 0 && @path[pos-1] == '..'
+      if pos > 0 && @path[pos - 1] == '..' || (@path[pos - 1] == '*' && @path[pos] != '..')
         case node
-        when Hash  then node.each {|k, v| each(node, k, pos, &blk) }
-        when Array then node.each_with_index {|n, i| each(node, i, pos, &blk) }
+        when Hash  then node.each { |k, _| each(node, k, pos, &blk) }
+        when Array then node.each_with_index { |_, i| each(node, i, pos, &blk) }
         end
       end
     end
 
     private
+
+    def filter_context(context, keys)
+      case context
+      when Hash
+        dig_as_hash(context, keys)
+      when Array
+        context.each_with_object([]) do |c, memo|
+          memo << dig_as_hash(c, keys)
+        end
+      end
+    end
+
+    def handle_wildecard(node, expr, _context, _key, pos, &blk)
+      expr[1, expr.size - 2].split(',').each do |sub_path|
+        case sub_path[0]
+        when '\'', '"'
+          k = sub_path[1, sub_path.size - 2]
+          yield_if_diggable(node, k) do
+            each(node, k, pos + 1, &blk)
+          end
+        when '?'
+          handle_question_mark(sub_path, node, pos, &blk)
+        else
+          next if node.is_a?(Array) && node.empty?
+          next if node.nil? # when default_path_leaf_to_null is true
+
+          array_args = sub_path.split(':')
+          if array_args[0] == '*'
+            start_idx = 0
+            end_idx = node.size - 1
+          elsif sub_path.count(':') == 0
+            start_idx = end_idx = process_function_or_literal(array_args[0], 0)
+            next unless start_idx
+            next if start_idx >= node.size
+          else
+            start_idx = process_function_or_literal(array_args[0], 0)
+            next unless start_idx
+
+            end_idx = array_args[1] && ensure_exclusive_end_index(process_function_or_literal(array_args[1], -1)) || -1
+            next unless end_idx
+            next if start_idx == end_idx && start_idx >= node.size
+          end
+          start_idx %= node.size
+          end_idx %= node.size
+          step = process_function_or_literal(array_args[2], 1)
+          next unless step
+
+          if @mode == :delete
+            (start_idx..end_idx).step(step) { |i| node[i] = nil }
+            node.compact!
+          else
+            (start_idx..end_idx).step(step) { |i| each(node, i, pos + 1, &blk) }
+          end
+        end
+      end
+    end
+
+    def ensure_exclusive_end_index(value)
+      return value unless value.is_a?(Integer) && value > 0
+
+      value - 1
+    end
+
+    def handle_question_mark(sub_path, node, pos, &blk)
+      case node
+      when Array
+        node.size.times do |index|
+          @_current_node = node[index]
+          if process_function_or_literal(sub_path[1, sub_path.size - 1])
+            each(@_current_node, nil, pos + 1, &blk)
+          end
+        end
+      when Hash
+        if process_function_or_literal(sub_path[1, sub_path.size - 1])
+          each(@_current_node, nil, pos + 1, &blk)
+        end
+      else
+        yield node if process_function_or_literal(sub_path[1, sub_path.size - 1])
+      end
+    end
+
     def yield_value(blk, context, key)
       case @mode
       when nil
-        blk.call(key ? context[key] : context)
+        blk.call(key ? dig_one(context, key) : context)
       when :compact
-        context.delete(key) if key && context[key].nil?
+        if key && context[key].nil?
+          key.is_a?(Integer) ? context.delete_at(key) : context.delete(key)
+        end
       when :delete
-        context.delete(key) if key
+        if key
+          key.is_a?(Integer) ? context.delete_at(key) : context.delete(key)
+        else
+          context.replace({})
+        end
       when :substitute
         if key
           context[key] = blk.call(context[key])
@@ -100,28 +144,23 @@ class JsonPath
     end
 
     def process_function_or_literal(exp, default = nil)
-      if exp.nil?
-        default
-      elsif exp[0] == ?(
-        return nil unless allow_eval? && @_current_node
-        match_result = /@\.(\p{Word}+)/.match(exp) || []
-        identifier = match_result[1]
-        # if there's no such method - convert into hash subscript
-        if !identifier.nil? && !@_current_node.methods.include?(identifier.to_sym)
-          exp_to_eval = exp.gsub(/@/, '@_current_node').gsub(/@_current_node.#{identifier}/,"@_current_node['#{identifier}']")
-          begin
-            return eval(exp_to_eval)
-          rescue StandardError # if eval failed because of bad arguments or missing methods
-            return default
-          end
+      return default if exp.nil? || exp.empty?
+      return Integer(exp) if exp[0] != '('
+      return nil unless @_current_node
+
+      identifiers = /@?((?<!\d)\.(?!\d)(\w+))+/.match(exp)
+      if !identifiers.nil? && !@_current_node.methods.include?(identifiers[2].to_sym)
+        exp_to_eval = exp.dup
+        exp_to_eval[identifiers[0]] = identifiers[0].split('.').map do |el|
+          el == '@' ? '@' : "['#{el}']"
+        end.join
+        begin
+          return JsonPath::Parser.new(@_current_node, @options).parse(exp_to_eval)
+        rescue StandardError
+          return default
         end
-        # otherwise eval as is
-        eval(exp.gsub(/@/, '@_current_node'))
-      elsif exp.empty?
-        default
-      else
-        Integer(exp)
       end
+      JsonPath::Parser.new(@_current_node, @options).parse(exp)
     end
   end
 end

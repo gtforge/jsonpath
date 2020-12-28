@@ -3,3 +3,8 @@ Gemfile.lock
 coverage/*
 doc/*
 .yardoc
+.DS_Store
+.idea
+vendor
+.tags
+*.gem

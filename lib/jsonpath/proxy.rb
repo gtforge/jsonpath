@@ -1,18 +1,20 @@
+# frozen_string_literal: true
+
 class JsonPath
   class Proxy
     attr_reader :obj
-    alias_method :to_hash, :obj
+    alias to_hash obj
 
     def initialize(obj)
       @obj = obj
     end
 
     def gsub(path, replacement = nil, &replacement_block)
-      _gsub(_deep_copy, path, replacement ? proc{replacement} : replacement_block)
+      _gsub(_deep_copy, path, replacement ? proc(&method(:replacement)) : replacement_block)
     end
 
     def gsub!(path, replacement = nil, &replacement_block)
-      _gsub(@obj, path, replacement ? proc{replacement} : replacement_block)
+      _gsub(@obj, path, replacement ? proc(&method(:replacement)) : replacement_block)
     end
 
     def delete(path = JsonPath::PATH_ALL)
@@ -32,8 +34,9 @@ class JsonPath
     end
 
     private
+
     def _deep_copy
-      Marshal::load(Marshal::dump(@obj))
+      Marshal.load(Marshal.dump(@obj))
     end
 
     def _gsub(obj, path, replacement)
@@ -43,7 +46,17 @@ class JsonPath
 
     def _delete(obj, path)
       JsonPath.new(path)[obj, :delete].each
+      obj = _remove(obj)
       Proxy.new(obj)
+    end
+
+    def _remove(obj)
+      obj.each do |o|
+        if o.is_a?(Hash) || o.is_a?(Array)
+          _remove(o)
+          o.delete({})
+        end
+      end
     end
 
     def _compact(obj, path)
